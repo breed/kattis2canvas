@@ -1,4 +1,5 @@
 import collections
+import concurrent.futures
 import configparser
 import datetime
 import logging
@@ -324,19 +325,27 @@ def submissions2canvas(offering, canvas_course, dryrun):
 
     kattis_user2canvas_id = {}
     canvas_id2kattis_user = {}
-    for e in course.get_enrollments():
-        if e.type != "StudentEnrollment":
-            continue
-        user = course.get_user(e.user_id)
-        profile = user.get_profile(include=["links"])
-        kattis_url = find_kattis_link(profile)
-        kattis_url = extract_last(kattis_url) if kattis_url else None
+    # this is so terribly slow because of all the requests, we need threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = []
+        for u in course.get_users(include=["enrollments"]):
+            if "StudentEnrollment" not in [e['type'] for e in u.enrollments]:
+                continue
 
-        if kattis_url:
-            kattis_user2canvas_id[kattis_url] = user
-            canvas_id2kattis_user[user.id] = kattis_url
-        else:
-            warn(f"kattis link missing for {user.name}.")
+            def get_profile(user):
+                profile = user.get_profile(include=["links"])
+                kattis_url = find_kattis_link(profile)
+                kattis_url = extract_last(kattis_url) if kattis_url else None
+
+                if kattis_url:
+                    kattis_user2canvas_id[kattis_url] = user
+                    canvas_id2kattis_user[user.id] = kattis_url
+                else:
+                    warn(f"kattis link missing for {user.name} {user.email}.")
+
+            futures.append(executor.submit(get_profile, u))
+        for f in futures:
+            f.result()
 
     kattis_group = None
     for ag in course.get_assignment_groups():
