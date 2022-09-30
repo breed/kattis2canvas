@@ -2,30 +2,41 @@ import collections
 import concurrent.futures
 import configparser
 import datetime
-import logging
 import re
 import sys
-from collections import namedtuple
 from fractions import Fraction
 from typing import NamedTuple, Optional
 
 import click
 import requests
+import requests.cookies
 import requests.exceptions
 from bs4 import BeautifulSoup
-from canvasapi import (Canvas)
+from canvasapi import Canvas
 from canvasapi.course import Course
+from canvasapi.user import User
 
 HEADERS = {'User-Agent': 'kattis-to-canvas'}
 
-Config = namedtuple(
-    "Config",
-    "kattis_username kattis_token kattis_loginurl kattis_hostname canvas_url canvas_token",
-)
-config: Optional[Config] = None
-login_cookies = None
 
-Student = namedtuple("Student", "kattis_url name email canvas_id")
+class Config(NamedTuple):
+    kattis_username: str
+    kattis_token: str
+    kattis_loginurl: str
+    kattis_hostname: str
+    canvas_url: str
+    canvas_token: str
+
+
+config: Optional[Config] = None
+login_cookies: Optional[requests.cookies.RequestsCookieJar] = None
+
+
+class Student(NamedTuple):
+    kattis_url: str
+    name: str
+    email: str
+    canvas_id: str
 
 
 class Submission(NamedTuple):
@@ -39,39 +50,41 @@ class Submission(NamedTuple):
 now = datetime.datetime.now(datetime.timezone.utc)
 
 
-def error(message):
+def error(message: str):
     click.echo(click.style(message, fg='red'))
 
 
-def info(message):
+def info(message: str):
     click.echo(click.style(message, fg='blue'))
 
 
-def warn(message):
+def warn(message: str):
     click.echo(click.style(message, fg='yellow'))
 
 
-def check_status(rsp):
+def check_status(rsp: requests.Response):
     if rsp.status_code != 200:
         error(f"got status {rsp.status_code} for {rsp.url}.")
         exit(6)
 
 
-def extract_last(pathish: str):
+# return the last element of a URL
+def extract_last(pathish: str) -> str:
     last_slash = pathish.rindex("/")
     if last_slash:
-        pathish = pathish[last_slash+1:]
+        pathish = pathish[last_slash + 1:]
     return pathish
 
 
+# for debugging
 def introspect(o):
     print("class", o.__class__)
     for i in dir(o):
         print(i)
 
 
-def web_get(url):
-    rsp = requests.get(url, cookies=login_cookies, headers=HEADERS)
+def web_get(url: str) -> requests.Response:
+    rsp: requests.Response = requests.get(url, cookies=login_cookies, headers=HEADERS)
     check_status(rsp)
     return rsp
 
@@ -91,19 +104,15 @@ def top():
         canvas_token=parser['canvas']['token'],
     )
     global login_cookies
-    login_cookies = login()
-
-
-def login():
     args = {'user': config.kattis_username, 'script': 'true', 'token': config.kattis_token}
     rsp = requests.post(config.kattis_loginurl, data=args, headers=HEADERS)
     if rsp.status_code != 200:
         error(f"Kattis login failed. Status: {rsp.status_code}")
         exit(2)
-    return rsp.cookies
+    login_cookies = rsp.cookies
 
 
-def get_offerings(offering_pattern):
+def get_offerings(offering_pattern: str) -> str:
     rsp = web_get(f"https://{config.kattis_hostname}/")
     bs = BeautifulSoup(rsp.content, 'html.parser')
     for a in bs.find_all('a'):
@@ -113,29 +122,37 @@ def get_offerings(offering_pattern):
 
 
 @top.command()
-@click.argument("offering", default="")
-def list_offerings(offering):
+@click.argument("name", default="")
+def list_offerings(name: str):
     """
     list the possible offerings.
-    :param offering: a substring of the offering name
+    :param name: a substring of the offering name
     """
 
-    for offering in get_offerings(offering):
-        info(offering)
+    for offering in get_offerings(name):
+        info(str(offering))
 
 
-def extract_kattis_date(element):
+# reformat kattis date format to canvas format
+def extract_kattis_date(element: str) -> str:
     return datetime.datetime.strftime(datetime.datetime.strptime(element, "%Y-%m-%d %H:%M %Z"), "%Y-%m-%dT%H:%M:00%z")
 
 
-def extract_canvas_date(element):
+# convert canvas UTC to datetime
+def extract_canvas_date(element: str) -> datetime.datetime:
     return datetime.datetime.strptime(element, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
 
 
-Assignment = namedtuple("Assignment", "url assignment_id title description start end")
+class Assignment(NamedTuple):
+    url: str
+    assignment_id: str
+    title: str
+    description: str
+    start: str
+    end: str
 
 
-def get_assignments(offering):
+def get_assignments(offering: str) -> [Assignment]:
     rsp = web_get(f"https://{config.kattis_hostname}{offering}")
     bs = BeautifulSoup(rsp.content, 'html.parser')
     for a in bs.find_all('a'):
@@ -216,7 +233,8 @@ def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) ->
 @click.argument("canvas_course")
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
 @click.option("--force/--no-force", default=False, help="force an update of an assignment if it already exists.")
-def course2canvas(offering, canvas_course, dryrun, force):
+@click.option("--add-to-module", help="the module to add the assignment to.")
+def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
     """
     create assignments in canvas for all the assignments in kattis.
     """
@@ -241,10 +259,20 @@ def course2canvas(offering, canvas_course, dryrun, force):
         error(f"no kattis assignment group in {canvas_course}")
         exit(4)
 
+    if add_to_module:
+        modules = {m.name: m for m in course.get_modules()}
+        if add_to_module in modules:
+            add_to_module = modules[add_to_module]
+        else:
+            error(f'could not find {add_to_module} in {modules.keys()}')
+            exit(4)
+
     canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
     # make sure assignments are in place
-    for assignment in get_assignments(offerings[0]):
+    sorted_assignments = list(get_assignments(offerings[0]))
+    sorted_assignments.sort(key=lambda a: a.start)
+    for assignment in sorted_assignments:
         description = assignment.description if assignment.description else ""
         if assignment.title in canvas_assignments:
             info(f"{assignment.title} already exists.")
@@ -252,7 +280,6 @@ def course2canvas(offering, canvas_course, dryrun, force):
                 if dryrun:
                     info(f"would update {assignment.title}.")
                 else:
-                    print(canvas_assignments[assignment.title])
                     canvas_assignments[assignment.title].edit(assignment={
                         'assignment_group_id': kattis_group.id,
                         'name': assignment.title,
@@ -261,12 +288,14 @@ def course2canvas(offering, canvas_course, dryrun, force):
                         'due_at': assignment.end,
                         'lock_at': assignment.end,
                         'unlock_at': assignment.start,
+                        'published': True,
                     })
+                    info(f"updated {assignment.title}.")
         else:
             if dryrun:
                 info(f"would create {assignment}")
             else:
-                course.create_assignment({
+                canvas_assignments[assignment.title] = course.create_assignment({
                     'assignment_group_id': kattis_group.id,
                     'name': assignment.title,
                     'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
@@ -274,8 +303,57 @@ def course2canvas(offering, canvas_course, dryrun, force):
                     'due_at': assignment.end,
                     'lock_at': assignment.end,
                     'unlock_at': assignment.start,
+                    'published': True,
                 })
                 info(f"created {assignment.title}.")
+        if add_to_module:
+            if assignment.title not in [i.title for i in add_to_module.get_module_items()]:
+                add_to_module.create_module_item(module_item={
+                    'title': assignment.title,
+                    'type': 'Assignment',
+                    'content_id': canvas_assignments[assignment.title].id,
+                })
+                info(f'{assignment.title} added to {add_to_module.name}')
+            else:
+                info(f'{assignment.title} already in {add_to_module.name}')
+
+
+def is_student_enrollment(user: User):
+    return "StudentEnrollment" in [e['type'] for e in user.enrollments]
+
+
+def find_kattis_link(profile: dict) -> str:
+    kattis_url = None
+    for link in profile["links"]:
+        if "kattis" in link["title"].lower():
+            kattis_url = link["url"]
+    return kattis_url
+
+
+class KattisLink(NamedTuple):
+    canvas_user: User
+    kattis_user: str
+
+
+def get_kattis_links(course: Course) -> [KattisLink]:
+    # this is so terribly slow because of all the requests, we need threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = []
+        for u in course.get_users(include=["enrollments"]):
+            if "StudentEnrollment" not in [e['type'] for e in u.enrollments]:
+                continue
+
+            def get_profile(user: User) -> Optional[KattisLink]:
+                profile = user.get_profile(include=["links"])
+                kattis_url = find_kattis_link(profile)
+                kattis_url = extract_last(kattis_url) if kattis_url else None
+                return KattisLink(canvas_user=user, kattis_user=kattis_url)
+
+            futures.append(executor.submit(get_profile, u))
+
+        links = [f.result() for f in futures if not None]
+        links.sort(key=lambda l: l.canvas_user.name)
+        return links
 
 
 @top.command()
@@ -287,21 +365,13 @@ def kattislinks(canvas_course):
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
-    for e in course.get_enrollments():
-        if e.type != "StudentEnrollment":
+    for link in get_kattis_links(course):
+        if not is_student_enrollment(link.canvas_user):
             continue
-        user = course.get_user(e.user_id)
-        profile = user.get_profile(include=["links"])
-        kattis_url = find_kattis_link(profile)
-        print(f"{profile['name']}\t{profile['primary_email']}\t{kattis_url}")
-
-
-def find_kattis_link(profile):
-    kattis_url = None
-    for link in profile["links"]:
-        if "kattis" in link["title"].lower():
-            kattis_url = link["url"]
-    return kattis_url
+        if link.kattis_user:
+            info(f"{link.canvas_user.name}\t{link.canvas_user.email}\t{link.kattis_user}")
+        else:
+            error(f"{link.canvas_user.name}\t{link.canvas_user.email} missing kattis link")
 
 
 @top.command()
@@ -325,27 +395,12 @@ def submissions2canvas(offering, canvas_course, dryrun):
 
     kattis_user2canvas_id = {}
     canvas_id2kattis_user = {}
-    # this is so terribly slow because of all the requests, we need threads
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        futures = []
-        for u in course.get_users(include=["enrollments"]):
-            if "StudentEnrollment" not in [e['type'] for e in u.enrollments]:
-                continue
-
-            def get_profile(user):
-                profile = user.get_profile(include=["links"])
-                kattis_url = find_kattis_link(profile)
-                kattis_url = extract_last(kattis_url) if kattis_url else None
-
-                if kattis_url:
-                    kattis_user2canvas_id[kattis_url] = user
-                    canvas_id2kattis_user[user.id] = kattis_url
-                else:
-                    warn(f"kattis link missing for {user.name} {user.email}.")
-
-            futures.append(executor.submit(get_profile, u))
-        for f in futures:
-            f.result()
+    for link in get_kattis_links(course):
+        if link.kattis_user:
+            kattis_user2canvas_id[link.kattis_user] = link.canvas_user
+            canvas_id2kattis_user[link.canvas_user.id] = link.kattis_user
+        else:
+            warn(f"kattis link missing for {link.canvas_user.name} {link.canvas_user.email}.")
 
     kattis_group = None
     for ag in course.get_assignment_groups():
@@ -371,7 +426,8 @@ def submissions2canvas(offering, canvas_course, dryrun):
             for canvas_submission in canvas_assignment.get_submissions(include=["submission_comments"]):
                 if canvas_submission.user_id in canvas_id2kattis_user:
                     if canvas_submission.user_id in submissions_by_user:
-                        warn(f'duplicate submission for {kattis_user2canvas_id[canvas_submission.user_id]} in {assignment.title}')
+                        warn(
+                            f'duplicate submission for {kattis_user2canvas_id[canvas_submission.user_id]} in {assignment.title}')
                     submissions_by_user[canvas_id2kattis_user[canvas_submission.user_id]] = canvas_submission
                     last_comment = datetime.datetime.fromordinal(1).replace(tzinfo=datetime.timezone.utc)
                     if canvas_submission.submission_comments:
@@ -392,13 +448,15 @@ def submissions2canvas(offering, canvas_course, dryrun):
                             warn(
                                 f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
                         else:
-                            submissions_by_user[user].edit(comment={'text_comment': f"Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
-                            info(f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
+                            submissions_by_user[user].edit(comment={
+                                'text_comment': f"Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
+                            info(
+                                f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
                         info(f"{user} up to date")
 
 
-def get_best_submissions(offering, assignment_id):
+def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
     best_submissions = collections.defaultdict(dict)
     rsp = web_get(f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions")
     bs = BeautifulSoup(rsp.content, "html.parser")
