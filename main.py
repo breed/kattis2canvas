@@ -1,16 +1,19 @@
+import collections
 import configparser
 import datetime
+import logging
 import re
 import sys
 from collections import namedtuple
+from fractions import Fraction
+from typing import NamedTuple, Optional
 
 import click
 import requests
 import requests.exceptions
 from bs4 import BeautifulSoup
-from canvasapi import (Canvas, assignment)
+from canvasapi import (Canvas)
 from canvasapi.course import Course
-
 
 HEADERS = {'User-Agent': 'kattis-to-canvas'}
 
@@ -18,14 +21,21 @@ Config = namedtuple(
     "Config",
     "kattis_username kattis_token kattis_loginurl kattis_hostname canvas_url canvas_token",
 )
-config = None
+config: Optional[Config] = None
 login_cookies = None
 
 Student = namedtuple("Student", "kattis_url name email canvas_id")
 
-Submission = namedtuple("Submission", "user score url date")
 
-now = datetime.datetime.utcnow()
+class Submission(NamedTuple):
+    user: str
+    problem: str
+    score: float
+    url: str
+    date: datetime.datetime
+
+
+now = datetime.datetime.now(datetime.timezone.utc)
 
 
 def error(message):
@@ -45,15 +55,25 @@ def check_status(rsp):
         error(f"got status {rsp.status_code} for {rsp.url}.")
         exit(6)
 
+
+def extract_last(pathish: str):
+    last_slash = pathish.rindex("/")
+    if last_slash:
+        pathish = pathish[last_slash+1:]
+    return pathish
+
+
 def introspect(o):
     print("class", o.__class__)
     for i in dir(o):
         print(i)
 
+
 def web_get(url):
     rsp = requests.get(url, cookies=login_cookies, headers=HEADERS)
     check_status(rsp)
     return rsp
+
 
 @click.group()
 def top():
@@ -88,7 +108,7 @@ def get_offerings(offering_pattern):
     for a in bs.find_all('a'):
         h = a.get('href')
         if h and re.match("/courses/[^/]+/[^/]+", h) and offering_pattern in h:
-            yield (h)
+            yield h
 
 
 @top.command()
@@ -103,11 +123,15 @@ def list_offerings(offering):
         info(offering)
 
 
-def extract_date(element):
+def extract_kattis_date(element):
     return datetime.datetime.strftime(datetime.datetime.strptime(element, "%Y-%m-%d %H:%M %Z"), "%Y-%m-%dT%H:%M:00%z")
 
 
-Assignment = namedtuple("Assignment", "url assignment_id title start end")
+def extract_canvas_date(element):
+    return datetime.datetime.strptime(element, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+Assignment = namedtuple("Assignment", "url assignment_id title description start end")
 
 
 def get_assignments(offering):
@@ -115,19 +139,28 @@ def get_assignments(offering):
     bs = BeautifulSoup(rsp.content, 'html.parser')
     for a in bs.find_all('a'):
         h = a.get('href')
-        if h and h.endswith("/problems"):
-            url = h.removesuffix("/problems")
-            rsp2 = web_get(f"https://{config.kattis_hostname}{url}")
+        if h and re.search(r"assignments/\w+$", h):
+            url = f"https://{config.kattis_hostname}{h}"
+            rsp2 = web_get(url)
             bs2 = BeautifulSoup(rsp2.content, 'html.parser')
-            all = iter(bs2.find_all("td"))
-            start=None
-            end=None
-            for td in all:
+            description_h2 = bs2.find("h2", string="Description", recursive=True)
+            description = None
+            if description_h2:
+                p = description_h2.find_next_sibling("p")
+                if p:
+                    description = p.text
+            all_td = iter(bs2.find_all("td"))
+            start = None
+            end = None
+            for td in all_td:
                 if td.get_text(strip=True).casefold() == "start time".casefold():
-                    start = extract_date(next(all).get_text(strip=True))
+                    start = extract_kattis_date(next(all_td).get_text(strip=True))
                 if td.get_text(strip=True).casefold() == "end time".casefold():
-                    end = extract_date(next(all).get_text(strip=True))
-            yield (Assignment(url=url, assignment_id=url[url.rindex('/')+1:], title=a.getText(), start=start, end=end))
+                    end = extract_kattis_date(next(all_td).get_text(strip=True))
+            yield (Assignment(
+                url=url, assignment_id=url[url.rindex('/') + 1:], title=a.getText(),
+                description=description, start=start, end=end
+            ))
 
 
 @top.command()
@@ -139,11 +172,12 @@ def list_assignments(offering):
     """
     for offering in get_offerings(offering):
         for assignment in get_assignments(offering):
-            info(assignment)
+            info(
+                f"{assignment.title}: {assignment.start} to {assignment.end} {assignment.description} {assignment.url}")
 
 
 def get_course(canvas, name, is_active=True) -> Course:
-    ''' find one course based on partial match '''
+    """ find one course based on partial match """
     course_list = get_courses(canvas, name, is_active)
     if len(course_list) == 0:
         error(f'no courses found that contain {name}. options are:')
@@ -159,9 +193,8 @@ def get_course(canvas, name, is_active=True) -> Course:
 
 
 def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) -> [Course]:
-    ''' find the courses based on partial match '''
+    """ find the courses based on partial match """
     courses = canvas.get_courses(enrollment_type="teacher")
-    now = datetime.datetime.now(datetime.timezone.utc)
     course_list = []
     for c in courses:
         start = c.start_at_date if hasattr(c, "start_at_date") else now
@@ -181,13 +214,14 @@ def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) ->
 @click.argument("offering")
 @click.argument("canvas_course")
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
-def course2canvas(offering, canvas_course, dryrun):
+@click.option("--force/--no-force", default=False, help="force an update of an assignment if it already exists.")
+def course2canvas(offering, canvas_course, dryrun, force):
     """
     create assignments in canvas for all the assignments in kattis.
     """
     offerings = list(get_offerings(offering))
     if len(offerings) == 0:
-        error(f"no offerings found for {offering}");
+        error(f"no offerings found for {offering}")
         exit(3)
     elif len(offerings) > 1:
         error(f"multiple offerings found for {offering}: {', '.join(offerings)}")
@@ -206,22 +240,36 @@ def course2canvas(offering, canvas_course, dryrun):
         error(f"no kattis assignment group in {canvas_course}")
         exit(4)
 
-    assignments = [a.name for a in course.get_assignments(assignment_group_id=kattis_group.id)]
+    canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
     # make sure assignments are in place
     for assignment in get_assignments(offerings[0]):
-        if assignment.title in assignments:
+        description = assignment.description if assignment.description else ""
+        if assignment.title in canvas_assignments:
             info(f"{assignment.title} already exists.")
+            if force:
+                if dryrun:
+                    info(f"would update {assignment.title}.")
+                else:
+                    print(canvas_assignments[assignment.title])
+                    canvas_assignments[assignment.title].edit(assignment={
+                        'assignment_group_id': kattis_group.id,
+                        'name': assignment.title,
+                        'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
+                        'points_possible': 100,
+                        'due_at': assignment.end,
+                        'lock_at': assignment.end,
+                        'unlock_at': assignment.start,
+                    })
         else:
             if dryrun:
                 info(f"would create {assignment}")
             else:
-                full_url = f"https://{config.kattis_hostname}{assignment.url}"
-
                 course.create_assignment({
                     'assignment_group_id': kattis_group.id,
                     'name': assignment.title,
-                    'description': f'Solve the problems found at <a href="{full_url}">{full_url}</a>.',
+                    'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
+                    'points_possible': 100,
                     'due_at': assignment.end,
                     'lock_at': assignment.end,
                     'unlock_at': assignment.start,
@@ -238,7 +286,6 @@ def kattislinks(canvas_course):
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
-    users = {}
     for e in course.get_enrollments():
         if e.type != "StudentEnrollment":
             continue
@@ -275,7 +322,7 @@ def submissions2canvas(offering, canvas_course, dryrun):
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
-    users = {}
+    kattis_user2canvas_id = {}
     canvas_id2kattis_user = {}
     for e in course.get_enrollments():
         if e.type != "StudentEnrollment":
@@ -283,9 +330,10 @@ def submissions2canvas(offering, canvas_course, dryrun):
         user = course.get_user(e.user_id)
         profile = user.get_profile(include=["links"])
         kattis_url = find_kattis_link(profile)
+        kattis_url = extract_last(kattis_url) if kattis_url else None
 
         if kattis_url:
-            users[kattis_url] = user
+            kattis_user2canvas_id[kattis_url] = user
             canvas_id2kattis_user[user.id] = kattis_url
         else:
             warn(f"kattis link missing for {user.name}.")
@@ -302,53 +350,47 @@ def submissions2canvas(offering, canvas_course, dryrun):
 
     assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
-    title2assignment = {}
-    latest_submissions_by_title = {}
-    # make sure assignments are in place
     for assignment in get_assignments(offerings[0]):
-        if assignment.title in assignments:
-            title2assignment[assignment.title] = assignments[assignment.title]
-            # find the latest submission for the assignment
-            latest_submissions = get_latest_submissions(offering=offerings[0], assignment_id=assignment.assignment_id)
-            if latest_submissions:
-                if assignment.title not in latest_submissions_by_title:
-                    latest_submissions_by_title[assignment.title] = latest_submissions
-                else:
-                    # take the latest if we have already seen this submission before
-                    original = latest_submissions_by_title[assignment.title]
-                    for key in latest_submissions:
-                        if key not in original or original[key].date > original[key].date:
-                            original[key] = latest_submissions[key]
+        if assignment.title not in assignments:
+            error(f"{assignment.title} not in canvas {canvas_course}")
         else:
-            warn(f"can't find assignment for {assignment.title}")
+            best_submissions = get_best_submissions(offering=offerings[0],
+                                                    assignment_id=assignment.assignment_id)
+            canvas_assignment = assignments[assignment.title]
+            # find the last submissions and only add a submission if the best submission is after latest
+            submissions_by_user = {}
+            for canvas_submission in canvas_assignment.get_submissions(include=["submission_comments"]):
+                if canvas_submission.user_id in canvas_id2kattis_user:
+                    if canvas_submission.user_id in submissions_by_user:
+                        warn(f'duplicate submission for {kattis_user2canvas_id[canvas_submission.user_id]} in {assignment.title}')
+                    submissions_by_user[canvas_id2kattis_user[canvas_submission.user_id]] = canvas_submission
+                    last_comment = datetime.datetime.fromordinal(1).replace(tzinfo=datetime.timezone.utc)
+                    if canvas_submission.submission_comments:
+                        for comment in canvas_submission.submission_comments:
+                            created_at = extract_canvas_date(comment['created_at'])
+                            if created_at > last_comment:
+                                last_comment = created_at
+                    canvas_submission.last_comment = last_comment
 
-    # go through all the latest submissions and update anything newer
-    for title, latest_submissions in latest_submissions_by_title.items():
-        canvas_assignment: assignment = title2assignment[title];
-        # we find new submissions by deleting the old stuff from latest_submissions and
-        # what is left will be new
-        for canvas_submission in canvas_assignment.get_submissions():
-            print(canvas_submission)
-            print(canvas_id2kattis_user)
-            print(users)
-            kattis_user = canvas_id2kattis_user[canvas_submission.user_id]
-            if latest_submissions[kattis_user].date <= canvas_submission.date:
-                del(latest_submissions[kattis_user])
-        for submission in latest_submissions.values():
-            if dryrun:
-                warn(f"would update {users[submission.user]} with {submission.url} and {submission.score}")
-            else:
-                canvas_assignment.submit({
-                    "submission_type": "online_text_entry",
-                    "body": f"Submission {submission.url} scored {submission.score}.",
-                    "submitted_at": submission.date,
-                    "user_id": users[submission.user].id,
-                })
+            for user, best in best_submissions.items():
+                for kattis_submission in best.values():
+                    if user not in submissions_by_user:
+                        warn(f"i don't see a canvas submission for {user}")
+                    elif user not in kattis_user2canvas_id:
+                        warn(f'skipping submission for unknown user {user}')
+                    elif kattis_submission.date > submissions_by_user[user].last_comment:
+                        if dryrun:
+                            warn(
+                                f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
+                        else:
+                            submissions_by_user[user].edit(comment={'text_comment': f"Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
+                            info(f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
+                    else:
+                        info(f"{user} up to date")
 
 
-
-def get_latest_submissions(offering, assignment_id):
-    latest_submissions = {}
+def get_best_submissions(offering, assignment_id):
+    best_submissions = collections.defaultdict(dict)
     rsp = web_get(f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions")
     bs = BeautifulSoup(rsp.content, "html.parser")
     judge_table = bs.find("table", id="judge_table")
@@ -375,10 +417,17 @@ def get_latest_submissions(offering, assignment_id):
             if date > now:
                 date -= datetime.timedelta(days=1)
 
-        submission = Submission(user=props["User"], date=date, score=props["Test cases"], url=props[""])
-        if submission.user not in latest_submissions or latest_submissions[submission.user].date < submission.date:
-            latest_submissions[submission.user] = submission
-    return latest_submissions
+        score = 0.0 if props["Test cases"] == "-/-" else float(Fraction(props["Test cases"])) * 100
+        submission = Submission(user=extract_last(props["User"]), problem=extract_last(props["Problem"]), date=date,
+                                score=score, url=props[""])
+        if submission.problem not in best_submissions[submission.user]:
+            best_submissions[submission.user] = {submission.problem: submission}
+        else:
+            current_best = best_submissions[submission.user][submission.problem]
+            if current_best.score < submission.score or (
+                    current_best.score == submission.score and current_best.date < submission.date):
+                best_submissions[submission.user][submission.problem] = submission
+    return best_submissions
 
 
 if __name__ == "__main__":
