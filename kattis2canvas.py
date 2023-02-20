@@ -497,5 +497,28 @@ def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submi
     return best_submissions
 
 
+@top.command()
+@click.argument("canvas_course")
+def sendemail(canvas_course):
+    """
+    Email students if they don't have a kattis link in their profile.
+    It takes one input argument canvas course name.
+    """
+    canvas = Canvas(config.canvas_url, config.canvas_token)
+    course = get_course(canvas, canvas_course)
+
+    for link in get_kattis_links(course):
+        if not is_student_enrollment(link.canvas_user):
+            continue
+        if not link.kattis_user:
+            args = {'access_token': config.canvas_token, 'recipients[]': link.canvas_user.id,
+                    'subject': 'Reminder: Add kattis link in profile',
+                    'body': "Hello " + link.canvas_user.name + "\n\n Please add the missing kattis link in bio for "
+                                                               "course " + canvas_course + "."}
+            rsp = requests.post(config.canvas_url + "api/v1/conversations", data=args)
+            if rsp.status_code != 201:
+                error(f"Kattis login failed. Status: {rsp.status_code}")
+
+
 if __name__ == "__main__":
     top()
