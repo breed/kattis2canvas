@@ -256,16 +256,38 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
             break
 
     if not kattis_group:
-        error(f"no kattis assignment group in {canvas_course}")
-        exit(4)
+        # create assignment group if not present on canvas
+        args = {'access_token': config.canvas_token, 'name': 'kattis'}
+        rsp = requests.post(config.canvas_url + "api/v1/courses/" + str(course.id) + "/assignment_groups", data=args)
+        if rsp.status_code != 200:
+            error(f"Unable to create kattis assignment group. Status: {rsp.status_code}")
+            exit(4)
+        else:
+            for ag in course.get_assignment_groups():
+                if ag.name == 'kattis':
+                    kattis_group = ag
+                    break
 
     if add_to_module:
         modules = {m.name: m for m in course.get_modules()}
         if add_to_module in modules:
             add_to_module = modules[add_to_module]
         else:
-            error(f'could not find {add_to_module} in {modules.keys()}')
-            exit(4)
+            args = {'access_token': config.canvas_token, 'module[name]': add_to_module}
+            rsp = requests.post(config.canvas_url + "api/v1/courses/" + str(course.id) + "/modules", data=args)
+            if rsp.status_code != 200:
+                error(f"Unable to create module. Status: {rsp.status_code}")
+                exit(4)
+            else:
+                modules = {m.name: m for m in course.get_modules()}
+                add_to_module = modules[add_to_module]
+            args = {'access_token': config.canvas_token, 'module[published]': "true"}
+            rsp = requests.put(
+                config.canvas_url + "api/v1/courses/" + str(course.id) + "/modules/" + str(add_to_module.id),
+                data=args)
+            if rsp.status_code != 200:
+                error(f"Unable to publish module. Status: {rsp.status_code}")
+                exit(4)
 
     canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
