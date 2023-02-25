@@ -12,7 +12,7 @@ import requests
 import requests.cookies
 import requests.exceptions
 from bs4 import BeautifulSoup
-from canvasapi import Canvas
+from canvasapi import Canvas, module
 from canvasapi.course import Course
 from canvasapi.user import User
 
@@ -254,40 +254,29 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
         if ag.name == 'kattis':
             kattis_group = ag
             break
-
     if not kattis_group:
         # create assignment group if not present on canvas
-        args = {'access_token': config.canvas_token, 'name': 'kattis'}
-        rsp = requests.post(config.canvas_url + "api/v1/courses/" + str(course.id) + "/assignment_groups", data=args)
-        if rsp.status_code != 200:
-            error(f"Unable to create kattis assignment group. Status: {rsp.status_code}")
-            exit(4)
+        if dryrun:
+            info(f"would create assignment group {kattis_group}.")
         else:
-            for ag in course.get_assignment_groups():
-                if ag.name == 'kattis':
-                    kattis_group = ag
-                    break
+            kattis_group = course.create_assignment_group(name='kattis')
+            info(f"created assignment group {kattis_group}.")
 
     if add_to_module:
         modules = {m.name: m for m in course.get_modules()}
         if add_to_module in modules:
             add_to_module = modules[add_to_module]
         else:
-            args = {'access_token': config.canvas_token, 'module[name]': add_to_module}
-            rsp = requests.post(config.canvas_url + "api/v1/courses/" + str(course.id) + "/modules", data=args)
-            if rsp.status_code != 200:
-                error(f"Unable to create module. Status: {rsp.status_code}")
-                exit(4)
+            if dryrun:
+                info(f"would create and publish {add_to_module}.")
             else:
-                modules = {m.name: m for m in course.get_modules()}
-                add_to_module = modules[add_to_module]
-            args = {'access_token': config.canvas_token, 'module[published]': "true"}
-            rsp = requests.put(
-                config.canvas_url + "api/v1/courses/" + str(course.id) + "/modules/" + str(add_to_module.id),
-                data=args)
-            if rsp.status_code != 200:
-                error(f"Unable to publish module. Status: {rsp.status_code}")
-                exit(4)
+                args = {"name": add_to_module}
+                add_to_module = course.create_module(module=args)
+                info(f"created module {add_to_module}.")
+
+                args = {'published': "true"}
+                add_to_module.edit(module=args)
+                info(f"published module {add_to_module}.")
 
     canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
@@ -533,13 +522,12 @@ def sendemail(canvas_course):
         if not is_student_enrollment(link.canvas_user):
             continue
         if not link.kattis_user:
-            args = {'access_token': config.canvas_token, 'recipients[]': link.canvas_user.id,
-                    'subject': 'Reminder: Add kattis link in profile',
-                    'body': "Hello " + link.canvas_user.name + "\n\n Please add the missing kattis link in bio for "
-                                                               "course " + canvas_course + "."}
-            rsp = requests.post(config.canvas_url + "api/v1/conversations", data=args)
-            if rsp.status_code != 201:
-                error(f"Kattis login failed. Status: {rsp.status_code}")
+            canvas.create_conversation(recipients=link.canvas_user.id,
+                                       body="Hello " + link.canvas_user.name + "\n\n\n Please add the missing kattis "
+                                                                               "link in bio for "
+                                                                               "course " + canvas_course + ".",
+                                       subject='Reminder: Add kattis link in profile')
+            info(f"Able to send conversation to : {link.canvas_user.id}")
 
 
 if __name__ == "__main__":
