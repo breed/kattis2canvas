@@ -305,6 +305,9 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
         else:
             if dryrun:
                 info(f"would create {assignment}")
+            elif 'late' in assignment.title and assignment.title.replace("-late", "") in canvas_assignments:
+                info(f"no new assignment created as --late assignment for {assignment.title.replace('-late', '')}.")
+                continue
             else:
                 canvas_assignments[assignment.title] = course.create_assignment({
                     'assignment_group_id': kattis_group.id,
@@ -426,12 +429,13 @@ def submissions2canvas(offering, canvas_course, dryrun):
     assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
 
     for assignment in get_assignments(offerings[0]):
-        if assignment.title not in assignments:
-            error(f"{assignment.title} not in canvas {canvas_course}")
+        if assignment.title.replace("-late", "") not in assignments:
+            error(f"{assignment.title.replace('-late', '')} not in canvas {canvas_course}")
         else:
+            prefix = "LATE: " if "late" in assignment.title else ""
             best_submissions = get_best_submissions(offering=offerings[0],
                                                     assignment_id=assignment.assignment_id)
-            canvas_assignment = assignments[assignment.title]
+            canvas_assignment = assignments[assignment.title.replace("-late", "")]
             # find the last submissions and only add a submission if the best submission is after latest
             submissions_by_user = {}
             for canvas_submission in canvas_assignment.get_submissions(include=["submission_comments"]):
@@ -460,7 +464,7 @@ def submissions2canvas(offering, canvas_course, dryrun):
                                 f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
                         else:
                             submissions_by_user[user].edit(comment={
-                                'text_comment': f"Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
+                                'text_comment': f"{prefix}Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
                             info(
                                 f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
