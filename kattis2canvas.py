@@ -278,12 +278,14 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
                 add_to_module.edit(module=args)
                 info(f"published module {add_to_module}.")
 
-    canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    canvas_assignments = {a.name: a for a in course.get_assignments()}
 
     # make sure assignments are in place
     sorted_assignments = list(get_assignments(offerings[0]))
     sorted_assignments.sort(key=lambda a: a.start)
     for assignment in sorted_assignments:
+        if assignment.title.endswith("-late") or assignment.title.endswith("-ignore"):
+            continue
         description = assignment.description if assignment.description else ""
         if assignment.title in canvas_assignments:
             info(f"{assignment.title} already exists.")
@@ -426,7 +428,7 @@ def submissions2canvas(offering, canvas_course, dryrun):
         error(f"no kattis assignment group in {canvas_course}")
         exit(4)
 
-    assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    assignments = {a.name: a for a in course.get_assignments()}
 
     for assignment in get_assignments(offerings[0]):
         if assignment.title.replace("-late", "") not in assignments:
