@@ -1,6 +1,6 @@
 # kattis2canvas
 
-this is a simple pythong tool that uses the canvasapi toolkit to integrate a kattis offering with a canvas course. the tool was specifically made to work with the commercial kattis (as you will see in a moment). it would take a bit of tweaking on the web scraping to make it work with open.kattis.com.
+this is a simple python tool that uses the canvasapi toolkit to integrate a kattis offering with a canvas course. the tool was specifically made to work with the commercial kattis (as you will see in a moment). it would take a bit of tweaking on the web scraping to make it work with open.kattis.com.
 
 the kattis connection is done using web scraping and thus it is very fragile! at the end, i will highlight where it is most vulnerable.
 
