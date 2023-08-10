@@ -97,14 +97,29 @@ def top():
     parser = configparser.ConfigParser()
     parser.read([config_ini])
     global config
-    config = Config(
-        kattis_username=parser['kattis']['username'],
-        kattis_token=parser['kattis']['token'],
-        kattis_hostname=parser['kattis']['hostname'],
-        kattis_loginurl=parser['kattis']['loginurl'],
-        canvas_url=parser['canvas']['url'],
-        canvas_token=parser['canvas']['token'],
-    )
+    try:
+        config = Config(
+            kattis_username=parser['kattis']['username'],
+            kattis_token=parser['kattis']['token'],
+            kattis_hostname=parser['kattis']['hostname'],
+            kattis_loginurl=parser['kattis']['loginurl'],
+            canvas_url=parser['canvas']['url'],
+            canvas_token=parser['canvas']['token'],
+        )
+    except:
+        print(f"""problem getting configuration from {config_ini}. should have the following lines:
+
+[kattis]
+username=kattis_username
+token=kattis_token
+hostname: something_like_sjsu.kattis.com
+loginurl: https://something_like_sjsu.kattis.com
+[canvas]
+url=https://something_like_sjsu.instructure.com
+token=convas_token
+""")
+        exit(2)
+
     global login_cookies
     args = {'user': config.kattis_username, 'script': 'true', 'token': config.kattis_token}
     rsp = requests.post(config.kattis_loginurl, data=args, headers=HEADERS)
@@ -137,6 +152,8 @@ def list_offerings(name: str):
 
 # reformat kattis date format to canvas format
 def extract_kattis_date(element: str) -> str:
+    if element == "infinity":
+        element = "2100-01-01 00:00 UTC"
     return datetime.datetime.strftime(datetime.datetime.strptime(element, "%Y-%m-%d %H:%M %Z"), "%Y-%m-%dT%H:%M:00%z")
 
 
