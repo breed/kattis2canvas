@@ -2,12 +2,14 @@ import collections
 import concurrent.futures
 import configparser
 import datetime
+import os
 import re
 import sys
 from fractions import Fraction
 from typing import NamedTuple, Optional
 
 import click
+import pprint
 import requests
 import requests.cookies
 import requests.exceptions
@@ -193,6 +195,40 @@ def list_assignments(offering):
             info(
                 f"{assignment.title}: {assignment.start} to {assignment.end} {assignment.description} {assignment.url}")
 
+
+@top.command()
+@click.argument("offering")
+@click.argument("assignment")
+def download_submissions(offering, assignment):
+    """
+    download the submissions for an assignment in an offering. offerings and assignments that have the given substring
+    will match.
+    """
+    for o in get_offerings(offering):
+        for a in get_assignments(o):
+            if assignment in a.title:
+                for student, probs in get_best_submissions(o, a.assignment_id).items():
+                    for problem, submission in probs.items():
+                       base_path = f"{offering}/{assignment}/{problem}/{student}"
+                       os.makedirs(base_path, exist_ok=True)
+                       rsp, name = download_submission(submission.url)
+                       with open(base_path + "/" + name, "wb") as f:
+                           f.write(rsp.content)
+
+
+def download_submission(url):
+    rsp = web_get(f"https://{config.kattis_hostname}{url}")
+    bs = BeautifulSoup(rsp.content, 'html.parser')
+    src_div = bs.find(class_="file_source-content-file", recursive=True)
+    a = src_div.find("a", recursive=True)
+    h3 = src_div.find("h3")
+    name = os.path.basename(h3.get_text().strip())
+    sanitize(name)
+    return web_get(f"https://{config.kattis_hostname}{a.get('href')}"), name
+
+
+def sanitize(name):
+    return re.sub(r"[^\w.]", "_", name)
 
 def get_course(canvas, name, is_active=True) -> Course:
     """ find one course based on partial match """
