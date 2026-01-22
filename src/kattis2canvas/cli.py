@@ -9,6 +9,7 @@ from fractions import Fraction
 from typing import NamedTuple, Optional
 
 import click
+from dateutil import parser as dateparser
 import pprint
 import requests
 import requests.cookies
@@ -150,11 +151,29 @@ def list_offerings(name: str):
         info(str(offering))
 
 
+# Common timezone abbreviations to UTC offsets
+TZINFOS = {
+    "UTC": 0,
+    "GMT": 0,
+    "CET": 3600,      # Central European Time (UTC+1)
+    "CEST": 7200,     # Central European Summer Time (UTC+2)
+    "EST": -18000,    # Eastern Standard Time (UTC-5)
+    "EDT": -14400,    # Eastern Daylight Time (UTC-4)
+    "CST": -21600,    # Central Standard Time (UTC-6)
+    "CDT": -18000,    # Central Daylight Time (UTC-5)
+    "MST": -25200,    # Mountain Standard Time (UTC-7)
+    "MDT": -21600,    # Mountain Daylight Time (UTC-6)
+    "PST": -28800,    # Pacific Standard Time (UTC-8)
+    "PDT": -25200,    # Pacific Daylight Time (UTC-7)
+}
+
+
 # reformat kattis date format to canvas format
 def extract_kattis_date(element: str) -> str:
     if element == "infinity":
         element = "2100-01-01 00:00 UTC"
-    return datetime.datetime.strftime(datetime.datetime.strptime(element, "%Y-%m-%d %H:%M %Z"), "%Y-%m-%dT%H:%M:00%z")
+    dt = dateparser.parse(element, tzinfos=TZINFOS)
+    return dt.strftime("%Y-%m-%dT%H:%M:00%z")
 
 
 # convert canvas UTC to datetime
@@ -310,7 +329,7 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
     if not kattis_group:
         # create assignment group if not present on canvas
         if dryrun:
-            info(f"would create assignment group {kattis_group}.")
+            info("would create assignment group 'kattis'.")
         else:
             kattis_group = course.create_assignment_group(name='kattis')
             info(f"created assignment group {kattis_group}.")
@@ -331,7 +350,11 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
                 add_to_module.edit(module=args)
                 info(f"published module {add_to_module}.")
 
-    canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    # In dryrun mode without existing kattis group, get all assignments; otherwise filter by group
+    if kattis_group:
+        canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    else:
+        canvas_assignments = {}
 
     # make sure assignments are in place
     sorted_assignments = list(get_assignments(offerings[0]))

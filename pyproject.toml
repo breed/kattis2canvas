@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kattis2canvas"
-version = "0.1.0"
+version = "0.1.2"
 description = "CLI tool to integrate Kattis offerings with Canvas LMS courses"
 readme = "README.md"
 license = "MIT"
@@ -31,6 +31,7 @@ dependencies = [
     "requests>=2.25",
     "beautifulsoup4>=4.9",
     "canvasapi>=2.0",
+    "python-dateutil>=2.8",
 ]
 
 [project.urls]
