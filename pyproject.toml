@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kattis2canvas"
+version = "0.1.0"
+description = "CLI tool to integrate Kattis offerings with Canvas LMS courses"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    {name = "bcr33d"}
+]
+keywords = ["kattis", "canvas", "lms", "education", "grading"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+]
+dependencies = [
+    "click>=8.0",
+    "requests>=2.25",
+    "beautifulsoup4>=4.9",
+    "canvasapi>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/bcr33d/kattis2canvas"
+Repository = "https://github.com/bcr33d/kattis2canvas"
+
+[project.scripts]
+kattis2canvas = "kattis2canvas.cli:top"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -27,15 +27,15 @@ you can easily get the kattis section by going to https://\<kattis>/download/kat
 you can check that everything is set up by running:
 
 ```
-python3 kattis2canvas.py list-offerings
-python3 kattis2canvas.py list-assignments
+kattis2canvas list-offerings
+kattis2canvas list-assignments
 ```
 
 or if you built the pyz file using make_zipapp.sh
 
 ```
-python3 kattis2canvas.pyz list-offerings
-python3 kattis2canvas.pyz list-assignments
+kattis2canvas list-offerings
+kattis2canvas list-assignments
 ```
 
 ## mapping student kattis accounts to canvas accounts
@@ -45,7 +45,7 @@ in canvas, you can associate various URLs with your account in the Links section
 you can check if the students have set up the links properly using
 
 ```
-python3 kattis2canvas.pyz kattislinks
+kattis2canvas kattislinks
 ```
 
 # using kattis2canvas
