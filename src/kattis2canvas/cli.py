@@ -306,7 +306,8 @@ def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) ->
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
 @click.option("--force/--no-force", default=False, help="force an update of an assignment if it already exists.")
 @click.option("--add-to-module", help="the module to add the assignment to.")
-def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
+@click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
+def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignment_group):
     """
     create assignments in canvas for all the assignments in kattis.
     """
@@ -321,18 +322,22 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
-    kattis_group = None
-    for ag in course.get_assignment_groups():
-        if ag.name == 'kattis':
-            kattis_group = ag
+    canvas_group = None
+    available_groups = list(course.get_assignment_groups())
+    for ag in available_groups:
+        if ag.name == assignment_group:
+            canvas_group = ag
             break
-    if not kattis_group:
-        # create assignment group if not present on canvas
+    if not canvas_group:
         if dryrun:
-            info("would create assignment group 'kattis'.")
+            error(f"assignment group '{assignment_group}' not found in {course.name}. available groups:")
+            for ag in available_groups:
+                error(f"    {ag.name}")
+            error(f"use --no-dryrun to create the assignment group, or specify an existing group with --assignment-group.")
+            exit(5)
         else:
-            kattis_group = course.create_assignment_group(name='kattis')
-            info(f"created assignment group {kattis_group}.")
+            canvas_group = course.create_assignment_group(name=assignment_group)
+            info(f"created assignment group '{assignment_group}'.")
 
     if add_to_module:
         modules = {m.name: m for m in course.get_modules()}
@@ -350,9 +355,9 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
                 add_to_module.edit(module=args)
                 info(f"published module {add_to_module}.")
 
-    # In dryrun mode without existing kattis group, get all assignments; otherwise filter by group
-    if kattis_group:
-        canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    # In dryrun mode without existing group, get all assignments; otherwise filter by group
+    if canvas_group:
+        canvas_assignments = {a.name: a for a in course.get_assignments(assignment_group_id=canvas_group.id)}
     else:
         canvas_assignments = {}
 
@@ -368,7 +373,7 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
                     info(f"would update {assignment.title}.")
                 else:
                     canvas_assignments[assignment.title].edit(assignment={
-                        'assignment_group_id': kattis_group.id,
+                        'assignment_group_id': canvas_group.id,
                         'name': assignment.title,
                         'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
                         'points_possible': 100,
@@ -386,7 +391,7 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module):
                 continue
             else:
                 canvas_assignments[assignment.title] = course.create_assignment({
-                    'assignment_group_id': kattis_group.id,
+                    'assignment_group_id': canvas_group.id,
                     'name': assignment.title,
                     'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
                     'points_possible': 100,
@@ -468,7 +473,8 @@ def kattislinks(canvas_course):
 @click.argument("offering")
 @click.argument("canvas_course")
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
-def submissions2canvas(offering, canvas_course, dryrun):
+@click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
+def submissions2canvas(offering, canvas_course, dryrun, assignment_group):
     """
     mirror summary of submission from kattis into canvas as a submission comment.
     """
@@ -492,17 +498,17 @@ def submissions2canvas(offering, canvas_course, dryrun):
         else:
             warn(f"kattis link missing for {link.canvas_user.name} {link.canvas_user.email}.")
 
-    kattis_group = None
+    canvas_group = None
     for ag in course.get_assignment_groups():
-        if ag.name == 'kattis':
-            kattis_group = ag
+        if ag.name == assignment_group:
+            canvas_group = ag
             break
 
-    if not kattis_group:
-        error(f"no kattis assignment group in {canvas_course}")
+    if not canvas_group:
+        error(f"no '{assignment_group}' assignment group in {canvas_course}")
         exit(4)
 
-    assignments = {a.name: a for a in course.get_assignments(assignment_group_id=kattis_group.id)}
+    assignments = {a.name: a for a in course.get_assignments(assignment_group_id=canvas_group.id)}
 
     for assignment in get_assignments(offerings[0]):
         if assignment.title.replace("-late", "") not in assignments:
