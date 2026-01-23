@@ -29,10 +29,11 @@ class Config(NamedTuple):
     kattis_hostname: str
     canvas_url: str
     canvas_token: str
+    kattis_password: str = ""  # Optional password for web access
 
 
 config: Optional[Config] = None
-login_cookies: Optional[requests.cookies.RequestsCookieJar] = None
+kattis_session: Optional[requests.Session] = None
 
 
 class Student(NamedTuple):
@@ -87,17 +88,24 @@ def introspect(o):
 
 
 def web_get(url: str) -> requests.Response:
-    rsp: requests.Response = requests.get(url, cookies=login_cookies, headers=HEADERS)
+    rsp: requests.Response = kattis_session.get(url)
     check_status(rsp)
     return rsp
 
 
-@click.group()
-def top():
-    config_ini = click.get_app_dir("kattis2canvas.ini")
+def get_config_path():
+    return click.get_app_dir("kattis2canvas.ini")
+
+
+def load_config():
+    """Load config and login to Kattis. Called by commands that need it."""
+    global config, kattis_session
+    if config is not None:
+        return  # Already loaded
+
+    config_ini = get_config_path()
     parser = configparser.ConfigParser()
     parser.read([config_ini])
-    global config
     try:
         config = Config(
             kattis_username=parser['kattis']['username'],
@@ -106,6 +114,7 @@ def top():
             kattis_loginurl=parser['kattis']['loginurl'],
             canvas_url=parser['canvas']['url'],
             canvas_token=parser['canvas']['token'],
+            kattis_password=parser['kattis'].get('password', ''),
         )
     except:
         print(f"""problem getting configuration from {config_ini}. should have the following lines:
@@ -113,21 +122,218 @@ def top():
 [kattis]
 username=kattis_username
 token=kattis_token
+password=kattis_password  # optional, for web access to submissions
 hostname: something_like_sjsu.kattis.com
-loginurl: https://something_like_sjsu.kattis.com
+loginurl: https://something_like_sjsu.kattis.com/login
 [canvas]
 url=https://something_like_sjsu.instructure.com
-token=convas_token
+token=canvas_token
+
+Run 'kattis2canvas setup' to configure.
 """)
         exit(2)
 
-    global login_cookies
-    args = {'user': config.kattis_username, 'script': 'true', 'token': config.kattis_token}
-    rsp = requests.post(config.kattis_loginurl, data=args, headers=HEADERS)
-    if rsp.status_code != 200:
-        error(f"Kattis login failed. Status: {rsp.status_code}")
+    # Create session and login to Kattis
+    kattis_session = requests.Session()
+    kattis_session.headers.update(HEADERS)
+
+    # Get CSRF token from login page
+    rsp = kattis_session.get(config.kattis_loginurl)
+    bs = BeautifulSoup(rsp.content, 'html.parser')
+    csrf_input = bs.find('input', {'name': 'csrf_token'})
+    csrf_token = csrf_input['value'] if csrf_input else None
+
+    # Login with password if available, otherwise try token
+    if config.kattis_password:
+        args = {'user': config.kattis_username, 'password': config.kattis_password, 'csrf_token': csrf_token}
+    else:
+        args = {'user': config.kattis_username, 'token': config.kattis_token, 'csrf_token': csrf_token}
+    rsp = kattis_session.post(config.kattis_loginurl, data=args)
+
+    # Verify login by checking if we can access a protected page
+    rsp = kattis_session.get(f"https://{config.kattis_hostname}/")
+    bs = BeautifulSoup(rsp.content, 'html.parser')
+    login_link = bs.find('a', string='Log in')
+    if login_link:
+        error("Kattis web login failed.")
+        if not config.kattis_password:
+            error("The API token only works for submissions, not web access.")
+            error("Add 'password=your_kattis_password' to the [kattis] section in your config file.")
+        else:
+            error("Check your username and password.")
         exit(2)
-    login_cookies = rsp.cookies
+
+
+@click.group()
+def top():
+    pass
+
+
+def test_kattis_login(username, password, loginurl, hostname):
+    """Test if Kattis credentials work for web access. Returns True if successful."""
+    if not all([username, password, loginurl, hostname]):
+        return False
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+        # Get CSRF token
+        rsp = session.get(loginurl)
+        bs = BeautifulSoup(rsp.content, 'html.parser')
+        csrf_input = bs.find('input', {'name': 'csrf_token'})
+        csrf_token = csrf_input['value'] if csrf_input else None
+
+        # Login with password
+        args = {'user': username, 'password': password, 'csrf_token': csrf_token}
+        session.post(loginurl, data=args)
+
+        # Check if actually logged in
+        rsp = session.get(f"https://{hostname}/")
+        bs = BeautifulSoup(rsp.content, 'html.parser')
+        login_link = bs.find('a', string='Log in')
+        return login_link is None
+    except:
+        return False
+
+
+def test_canvas_login(url, token):
+    """Test if Canvas credentials work. Returns True if successful."""
+    if not all([url, token]):
+        return False
+    try:
+        canvas = Canvas(url, token)
+        # Try to get current user - this will fail if credentials are bad
+        canvas.get_current_user()
+        return True
+    except:
+        return False
+
+
+@top.command()
+def setup():
+    """
+    Set up or update Kattis and Canvas credentials.
+    """
+    config_ini = get_config_path()
+    parser = configparser.ConfigParser()
+    parser.read([config_ini])
+
+    # Ensure sections exist
+    if 'kattis' not in parser:
+        parser['kattis'] = {}
+    if 'canvas' not in parser:
+        parser['canvas'] = {}
+
+    config_changed = False
+
+    # Test existing Kattis credentials
+    kattis_username = parser['kattis'].get('username', '')
+    kattis_password = parser['kattis'].get('password', '')
+    kattis_hostname = parser['kattis'].get('hostname', '')
+    kattis_loginurl = parser['kattis'].get('loginurl', '')
+
+    info("=== Kattis Configuration ===")
+    if test_kattis_login(kattis_username, kattis_password, kattis_loginurl, kattis_hostname):
+        info(f"Kattis login OK (user: {kattis_username}, host: {kattis_hostname})")
+    else:
+        if kattis_username:
+            warn(f"Kattis web login failed for {kattis_username}")
+
+        if kattis_hostname:
+            kattisrc_url = f"https://{kattis_hostname}/download/kattisrc"
+        else:
+            kattisrc_url = "https://<your-school>.kattis.com/download/kattisrc"
+
+        info(f"Go to: {kattisrc_url}")
+        info("(Log in if needed, then copy the entire contents of the file)")
+        info("")
+        info("Paste the contents of your .kattisrc file below, then press Enter twice:")
+
+        lines = []
+        while True:
+            try:
+                line = input()
+                if line == "" and lines and lines[-1] == "":
+                    break
+                lines.append(line)
+            except EOFError:
+                break
+
+        kattisrc_content = "\n".join(lines)
+
+        if kattisrc_content.strip():
+            kattisrc = configparser.ConfigParser()
+            kattisrc.read_string(kattisrc_content)
+
+            try:
+                parser['kattis']['username'] = kattisrc['user']['username']
+                parser['kattis']['token'] = kattisrc['user']['token']
+                parser['kattis']['hostname'] = kattisrc['kattis']['hostname']
+                # Ensure loginurl ends with /login
+                loginurl = kattisrc['kattis']['loginurl']
+                if not loginurl.endswith('/login'):
+                    loginurl = loginurl.rstrip('/') + '/login'
+                parser['kattis']['loginurl'] = loginurl
+                config_changed = True
+                info("Kattis config from .kattisrc saved.")
+            except KeyError as e:
+                error(f"Could not parse .kattisrc content: missing {e}")
+                return
+        else:
+            info("No .kattisrc content provided.")
+
+        # Ask for password for web access
+        info("")
+        info("The Kattis API token only works for submissions, not web access.")
+        info("To access the submissions page, you need your Kattis password.")
+        kattis_password = click.prompt("Kattis password (for web access)",
+                                       default=parser['kattis'].get('password', ''),
+                                       hide_input=True)
+        if kattis_password:
+            parser['kattis']['password'] = kattis_password
+            config_changed = True
+
+            # Verify the credentials work
+            if test_kattis_login(parser['kattis'].get('username', ''), kattis_password,
+                               parser['kattis'].get('loginurl', ''), parser['kattis'].get('hostname', '')):
+                info("Kattis web login verified.")
+            else:
+                warn("Kattis web login failed. Check your password.")
+
+    info("")
+    info("=== Canvas Configuration ===")
+    canvas_url = parser['canvas'].get('url', '')
+    canvas_token = parser['canvas'].get('token', '')
+
+    if test_canvas_login(canvas_url, canvas_token):
+        info(f"Canvas login OK ({canvas_url})")
+    else:
+        if canvas_url:
+            warn(f"Canvas login failed for {canvas_url}")
+
+        canvas_url = click.prompt("Canvas URL (e.g., https://sjsu.instructure.com)",
+                                  default=canvas_url)
+        canvas_token = click.prompt("Canvas API token (from Account > Settings > New Access Token)",
+                                    default=canvas_token)
+
+        parser['canvas']['url'] = canvas_url
+        parser['canvas']['token'] = canvas_token
+        config_changed = True
+
+        # Verify the new credentials work
+        if test_canvas_login(canvas_url, canvas_token):
+            info("Canvas credentials verified and saved.")
+        else:
+            error("Canvas login still failing with new credentials.")
+
+    # Write config if changed
+    if config_changed:
+        os.makedirs(os.path.dirname(config_ini), exist_ok=True)
+        with open(config_ini, 'w') as f:
+            parser.write(f)
+        info(f"Configuration saved to {config_ini}")
+    else:
+        info("All credentials OK, no changes needed.")
 
 
 def get_offerings(offering_pattern: str) -> str:
@@ -146,7 +352,7 @@ def list_offerings(name: str):
     list the possible offerings.
     :param name: a substring of the offering name
     """
-
+    load_config()
     for offering in get_offerings(name):
         info(str(offering))
 
@@ -168,12 +374,14 @@ TZINFOS = {
 }
 
 
-# reformat kattis date format to canvas format
+# reformat kattis date format to canvas format (ISO 8601 UTC)
 def extract_kattis_date(element: str) -> str:
     if element == "infinity":
         element = "2100-01-01 00:00 UTC"
     dt = dateparser.parse(element, tzinfos=TZINFOS)
-    return dt.strftime("%Y-%m-%dT%H:%M:00%z")
+    # Convert to UTC and format with Z suffix for Canvas API
+    dt_utc = dt.astimezone(datetime.timezone.utc)
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # convert canvas UTC to datetime
@@ -226,6 +434,7 @@ def list_assignments(offering):
     list the assignments for the given offering.
     :param offering: a substring of the offering name
     """
+    load_config()
     for offering in get_offerings(offering):
         for assignment in get_assignments(offering):
             info(
@@ -240,6 +449,7 @@ def download_submissions(offering, assignment):
     download the submissions for an assignment in an offering. offerings and assignments that have the given substring
     will match.
     """
+    load_config()
     for o in get_offerings(offering):
         for a in get_assignments(o):
             if assignment in a.title:
@@ -282,6 +492,32 @@ def get_course(canvas, name, is_active=True) -> Course:
     return course_list[0]
 
 
+def get_section(course: Course, section_name: str):
+    """Find a section by name or unique substring. Returns the section or exits with error."""
+    sections = list(course.get_sections())
+
+    # First try exact match
+    for section in sections:
+        if section.name == section_name:
+            return section
+
+    # Try substring match
+    matching = [s for s in sections if section_name in s.name]
+
+    if len(matching) == 1:
+        return matching[0]
+    elif len(matching) > 1:
+        error(f"multiple sections match '{section_name}':")
+        for section in matching:
+            error(f"    {section.name}")
+        exit(6)
+    else:
+        error(f"section '{section_name}' not found in {course.name}. available sections:")
+        for section in sections:
+            error(f"    {section.name}")
+        exit(6)
+
+
 def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) -> [Course]:
     """ find the courses based on partial match """
     courses = canvas.get_courses(enrollment_type="teacher")
@@ -307,10 +543,12 @@ def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) ->
 @click.option("--force/--no-force", default=False, help="force an update of an assignment if it already exists.")
 @click.option("--add-to-module", help="the module to add the assignment to.")
 @click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
-def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignment_group):
+@click.option("--section", help="only create assignments for this specific section.")
+def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignment_group, section):
     """
     create assignments in canvas for all the assignments in kattis.
     """
+    load_config()
     offerings = list(get_offerings(offering))
     if len(offerings) == 0:
         error(f"no offerings found for {offering}")
@@ -321,6 +559,11 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
 
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
+
+    # Get section if specified
+    canvas_section = None
+    if section:
+        canvas_section = get_section(course, section)
 
     canvas_group = None
     available_groups = list(course.get_assignment_groups())
@@ -366,41 +609,49 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
     sorted_assignments.sort(key=lambda a: a.start)
     for assignment in sorted_assignments:
         description = assignment.description if assignment.description else ""
+
+        # Base assignment data
+        assignment_data = {
+            'assignment_group_id': canvas_group.id,
+            'name': assignment.title,
+            'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
+            'points_possible': 100,
+            'published': True,
+        }
+
+        # If section specified, use assignment overrides instead of base dates
+        if canvas_section:
+            assignment_data['only_visible_to_overrides'] = True
+            assignment_data['assignment_overrides'] = [{
+                'course_section_id': canvas_section.id,
+                'due_at': assignment.end,
+                'lock_at': assignment.end,
+                'unlock_at': assignment.start,
+            }]
+        else:
+            assignment_data['due_at'] = assignment.end
+            assignment_data['lock_at'] = assignment.end
+            assignment_data['unlock_at'] = assignment.start
+
         if assignment.title in canvas_assignments:
             info(f"{assignment.title} already exists.")
             if force:
                 if dryrun:
                     info(f"would update {assignment.title}.")
                 else:
-                    canvas_assignments[assignment.title].edit(assignment={
-                        'assignment_group_id': canvas_group.id,
-                        'name': assignment.title,
-                        'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
-                        'points_possible': 100,
-                        'due_at': assignment.end,
-                        'lock_at': assignment.end,
-                        'unlock_at': assignment.start,
-                        'published': True,
-                    })
+                    canvas_assignments[assignment.title].edit(assignment=assignment_data)
                     info(f"updated {assignment.title}.")
         else:
             if dryrun:
-                info(f"would create {assignment}")
+                section_info = f" (section: {section})" if canvas_section else ""
+                info(f"would create {assignment}{section_info}")
             elif 'late' in assignment.title and assignment.title.replace("-late", "") in canvas_assignments:
                 info(f"no new assignment created as --late assignment for {assignment.title.replace('-late', '')}.")
                 continue
             else:
-                canvas_assignments[assignment.title] = course.create_assignment({
-                    'assignment_group_id': canvas_group.id,
-                    'name': assignment.title,
-                    'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
-                    'points_possible': 100,
-                    'due_at': assignment.end,
-                    'lock_at': assignment.end,
-                    'unlock_at': assignment.start,
-                    'published': True,
-                })
-                info(f"created {assignment.title}.")
+                canvas_assignments[assignment.title] = course.create_assignment(assignment_data)
+                section_info = f" for section {section}" if canvas_section else ""
+                info(f"created {assignment.title}{section_info}.")
         if add_to_module:
             if assignment.title not in [i.title for i in add_to_module.get_module_items()]:
                 add_to_module.create_module_item(module_item={
@@ -430,13 +681,20 @@ class KattisLink(NamedTuple):
     kattis_user: str
 
 
-def get_kattis_links(course: Course) -> [KattisLink]:
+def get_kattis_links(course: Course, section_id: int = None) -> [KattisLink]:
     # this is so terribly slow because of all the requests, we need threads
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = []
         for u in course.get_users(include=["enrollments"]):
-            if "StudentEnrollment" not in [e['type'] for e in u.enrollments]:
+            # Check for student enrollment
+            student_enrollments = [e for e in u.enrollments if e['type'] == "StudentEnrollment"]
+            if not student_enrollments:
                 continue
+
+            # If section specified, filter by section
+            if section_id:
+                if not any(e.get('course_section_id') == section_id for e in student_enrollments):
+                    continue
 
             def get_profile(user: User) -> Optional[KattisLink]:
                 profile = user.get_profile(include=["links"])
@@ -457,6 +715,7 @@ def kattislinks(canvas_course):
     """
     list the students in the class with their email and kattis links.
     """
+    load_config()
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
@@ -474,10 +733,12 @@ def kattislinks(canvas_course):
 @click.argument("canvas_course")
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
 @click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
-def submissions2canvas(offering, canvas_course, dryrun, assignment_group):
+@click.option("--section", help="only process submissions for students in this specific section.")
+def submissions2canvas(offering, canvas_course, dryrun, assignment_group, section):
     """
     mirror summary of submission from kattis into canvas as a submission comment.
     """
+    load_config()
     offerings = list(get_offerings(offering))
     if len(offerings) == 0:
         error(f"no offerings found for {offering}")
@@ -489,9 +750,17 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group):
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
+    # Get section if specified
+    canvas_section = None
+    section_id = None
+    if section:
+        canvas_section = get_section(course, section)
+        section_id = canvas_section.id
+        info(f"filtering students by section: {section}")
+
     kattis_user2canvas_id = {}
     canvas_id2kattis_user = {}
-    for link in get_kattis_links(course):
+    for link in get_kattis_links(course, section_id=section_id):
         if link.kattis_user:
             kattis_user2canvas_id[link.kattis_user] = link.canvas_user
             canvas_id2kattis_user[link.canvas_user.id] = link.kattis_user
@@ -537,7 +806,7 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group):
             for user, best in best_submissions.items():
                 for kattis_submission in best.values():
                     if user not in submissions_by_user:
-                        warn(f"i don't see a canvas submission for {user}")
+                        warn(f"i don't see a canvas user for {user}")
                     elif user not in kattis_user2canvas_id:
                         warn(f'skipping submission for unknown user {user}')
                     elif kattis_submission.date > submissions_by_user[user].last_comment:
@@ -555,9 +824,13 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group):
 
 def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
     best_submissions = collections.defaultdict(dict)
-    rsp = web_get(f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions")
+    url = f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions"
+    rsp = web_get(url)
     bs = BeautifulSoup(rsp.content, "html.parser")
     judge_table = bs.find("table", id="judge_table")
+    if not judge_table:
+        info(f"no submissions yet for {assignment_id}")
+        return best_submissions
     headers = [x.get_text().strip() for x in judge_table.find_all("th")]
     tbody = judge_table.find("tbody")
     for submissions in tbody.find_all("tr", recursive=False):
@@ -601,6 +874,7 @@ def sendemail(canvas_course):
     Email students if they don't have a kattis link in their profile.
     It takes one input argument canvas course name.
     """
+    load_config()
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
 
