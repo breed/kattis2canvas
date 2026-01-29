@@ -614,7 +614,7 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
         assignment_data = {
             'assignment_group_id': canvas_group.id,
             'name': assignment.title,
-            'description': f'Solve the problems found at <a href="{assignment.url}">{assignment.url}</a>. {description}',
+            'description': f'Solve the problems found at <a href="{assignment.url}" target="kattis-details">{assignment.url}</a>. {description}',
             'points_possible': 100,
             'published': True,
         }
@@ -814,8 +814,9 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                             warn(
                                 f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
                         else:
+                            href_url = f"https://{config.kattis_hostname}{kattis_submission.url}"
                             submissions_by_user[user].edit(comment={
-                                'text_comment': f"{prefix}Submission https://{config.kattis_hostname}{kattis_submission.url} scored {kattis_submission.score} on {kattis_submission.problem}."})
+                                'text_comment': f"{prefix}Submission <a href={href_url}>{href_url}</a> scored {kattis_submission.score} on {kattis_submission.problem}."})
                             info(
                                 f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
