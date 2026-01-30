@@ -734,10 +734,12 @@ def kattislinks(canvas_course):
 @click.option("--dryrun/--no-dryrun", default=True, help="show planned actions, do not make them happen.")
 @click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
 @click.option("--section", help="only process submissions for students in this specific section.")
-def submissions2canvas(offering, canvas_course, dryrun, assignment_group, section):
+@click.option("--force-comment/--no-force-comment", default=False, help="add a comment about the best submission even if there is already a comment in canvas.")
+def submissions2canvas(offering, canvas_course, dryrun, assignment_group, section, force_comment):
     """
     mirror summary of submission from kattis into canvas as a submission comment.
     """
+    print(force_comment)
     load_config()
     offerings = list(get_offerings(offering))
     if len(offerings) == 0:
@@ -796,20 +798,22 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                             f'duplicate submission for {kattis_user2canvas_id[canvas_submission.user_id]} in {assignment.title}')
                     submissions_by_user[canvas_id2kattis_user[canvas_submission.user_id]] = canvas_submission
                     last_comment = datetime.datetime.fromordinal(1).replace(tzinfo=datetime.timezone.utc)
+                    last_comment_text = ''
                     if canvas_submission.submission_comments:
                         for comment in canvas_submission.submission_comments:
                             created_at = extract_canvas_date(comment['created_at'])
-                            if created_at > last_comment:
+                            if config.kattis_hostname in comment.get('comment', '') and created_at > last_comment:
                                 last_comment = created_at
+                                last_comment_text = comment.get('comment', '')
                     canvas_submission.last_comment = last_comment
-
+                    canvas_submission.last_comment_text = last_comment_text
             for user, best in best_submissions.items():
                 for kattis_submission in best.values():
                     if user not in submissions_by_user:
                         warn(f"i don't see a canvas user for {user}")
                     elif user not in kattis_user2canvas_id:
                         warn(f'skipping submission for unknown user {user}')
-                    elif kattis_submission.date > submissions_by_user[user].last_comment:
+                    elif kattis_submission.date > submissions_by_user[user].last_comment or force_comment:
                         if dryrun:
                             warn(
                                 f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
@@ -820,51 +824,67 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                             info(
                                 f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
-                        info(f"{user} up to date")
+                        info(f"{user} up to date {kattis_submission.date} > {submissions_by_user[user].last_comment} {submissions_by_user[user].last_comment_text} ")
 
 
 def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
     best_submissions = collections.defaultdict(dict)
-    url = f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions"
-    rsp = web_get(url)
-    bs = BeautifulSoup(rsp.content, "html.parser")
-    judge_table = bs.find("table", id="judge_table")
-    if not judge_table:
-        info(f"no submissions yet for {assignment_id}")
-        return best_submissions
-    headers = [x.get_text().strip() for x in judge_table.find_all("th")]
-    tbody = judge_table.find("tbody")
-    for submissions in tbody.find_all("tr", recursive=False):
-        if not submissions.get("data-submission-id"):
-            continue
-        submissions = submissions.find_all("td", recursive=False)
-        if not submissions:
-            continue
-        props = {}
-        for index, td in enumerate(submissions):
-            a = td.find("a")
-            props[headers[index]] = a.get("href") if a else td.get_text().strip()
-        date = props["Date"]
-        if "-" in date:
-            date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo)
-        else:
-            hms = datetime.datetime.strptime(date, "%H:%M:%S")
-            date = now.replace(hour=hms.hour, minute=hms.minute, second=hms.second)
-            # it's not clear when the short date version is used. it might be used when it is less than 24 hours,
-            # in which case, just setting the time will make the date 24 hours more than it should be
-            if date > now:
-                date -= datetime.timedelta(days=1)
+    base_url = f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions"
+    headers = None
+    page = 0
 
-        score = 0.0 if props["Test cases"] == "-/-" else float(Fraction(props["Test cases"])) * 100
-        submission = Submission(user=extract_last(props["User"]), problem=extract_last(props["Problem"]), date=date,
-                                score=score, url=props[""])
-        if submission.problem not in best_submissions[submission.user]:
-            best_submissions[submission.user] = {submission.problem: submission}
-        else:
-            current_best = best_submissions[submission.user][submission.problem]
-            if current_best.score < submission.score or (
-                    current_best.score == submission.score and current_best.date < submission.date):
+    while True:
+        url = f"{base_url}?page={page}"
+        rsp = web_get(url)
+        bs = BeautifulSoup(rsp.content, "html.parser")
+        judge_table = bs.find("table", id="judge_table")
+
+        if not judge_table:
+            if page == 0:
+                info(f"no submissions yet for {assignment_id}")
+            break
+
+        if headers is None:
+            headers = [x.get_text().strip() for x in judge_table.find_all("th")]
+
+        tbody = judge_table.find("tbody")
+        rows = [r for r in tbody.find_all("tr", recursive=False) if r.get("data-submission-id")]
+
+        if not rows:
+            break
+
+        for row in rows:
+            cells = row.find_all("td", recursive=False)
+            if not cells:
+                continue
+            props = {}
+            for index, td in enumerate(cells):
+                a = td.find("a")
+                props[headers[index]] = a.get("href") if a else td.get_text().strip()
+            date = props["Date"]
+            if "-" in date:
+                date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo)
+            else:
+                hms = datetime.datetime.strptime(date, "%H:%M:%S")
+                date = now.replace(hour=hms.hour, minute=hms.minute, second=hms.second)
+                # it's not clear when the short date version is used. it might be used when it is less than 24 hours,
+                # in which case, just setting the time will make the date 24 hours more than it should be
+                if date > now:
+                    date -= datetime.timedelta(days=1)
+
+            score = 0.0 if props["Test cases"] == "-/-" else float(Fraction(props["Test cases"])) * 100
+            submission = Submission(user=extract_last(props["User"]), problem=extract_last(props["Problem"]), date=date,
+                                    score=score, url=props[""])
+            if submission.problem not in best_submissions[submission.user]:
                 best_submissions[submission.user][submission.problem] = submission
+            else:
+                current_best = best_submissions[submission.user][submission.problem]
+                if current_best.score < submission.score or (
+                        current_best.score == submission.score and current_best.date < submission.date):
+                    best_submissions[submission.user][submission.problem] = submission
+
+        page += 1
+
     return best_submissions
 
 
