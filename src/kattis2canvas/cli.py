@@ -739,7 +739,6 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
     """
     mirror summary of submission from kattis into canvas as a submission comment.
     """
-    print(force_comment)
     load_config()
     offerings = list(get_offerings(offering))
     if len(offerings) == 0:
@@ -824,7 +823,7 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                             info(
                                 f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
-                        info(f"{user} up to date {kattis_submission.date} > {submissions_by_user[user].last_comment} {submissions_by_user[user].last_comment_text} ")
+                        info(f"{user} up to date")
 
 
 def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
