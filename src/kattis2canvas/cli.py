@@ -2,6 +2,7 @@ import collections
 import concurrent.futures
 import configparser
 import datetime
+import html
 import os
 import re
 import sys
@@ -476,6 +477,38 @@ def download_submission(url):
 def sanitize(name):
     return re.sub(r"[^\w.]", "_", name)
 
+
+def get_submission_source(url: str) -> tuple[str, str] | None:
+    """
+    Download the source code of a submission if it's less than 8KB.
+    Returns (filename, source_code) tuple or None if file is too large or not found.
+    """
+    try:
+        rsp = web_get(f"https://{config.kattis_hostname}{url}?tab=submitted-files")
+        bs = BeautifulSoup(rsp.content, 'html.parser')
+        src_div = bs.find(class_="file_source-content-file", recursive=True)
+        if not src_div:
+            return None
+
+        h3 = src_div.find("h3")
+        filename = os.path.basename(h3.get_text().strip()) if h3 else "source"
+
+        # Find the source-highlight div containing the actual code
+        code_elem = bs.find(class_="source-highlight", recursive=True)
+        if not code_elem:
+            return None
+
+        source_code = code_elem.get_text()
+
+        # Check if less than 8KB
+        if len(source_code.encode('utf-8')) > 8 * 1024:
+            return None
+
+        return (filename, source_code)
+    except Exception as e:
+        warn(f"failed to get source for {url}: {e}")
+        return None
+
 def get_course(canvas, name, is_active=True) -> Course:
     """ find one course based on partial match """
     course_list = get_courses(canvas, name, is_active)
@@ -813,13 +846,21 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                     elif user not in kattis_user2canvas_id:
                         warn(f'skipping submission for unknown user {user}')
                     elif kattis_submission.date > submissions_by_user[user].last_comment or force_comment:
+                        href_url = f"https://{config.kattis_hostname}{kattis_submission.url}"
+                        comment_text = f"{prefix}Submission <a href={href_url}>{href_url}</a> scored {kattis_submission.score} on {kattis_submission.problem}."
+
+                        # Try to include source code if < 8KB
+                        source_info = get_submission_source(kattis_submission.url)
+                        if source_info:
+                            filename, source_code = source_info
+                            comment_text += f"\n<br/>\n<strong>{html.escape(filename)}</strong>\n<pre>{html.escape(source_code)}</pre>"
+
                         if dryrun:
-                            warn(
-                                f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem} scored {kattis_submission.score}")
+                            warn(f"would update {kattis_user2canvas_id[kattis_submission.user]} on problem {kattis_submission.problem}:")
+                            print(comment_text)
+                            print("---")
                         else:
-                            href_url = f"https://{config.kattis_hostname}{kattis_submission.url}"
-                            submissions_by_user[user].edit(comment={
-                                'text_comment': f"{prefix}Submission <a href={href_url}>{href_url}</a> scored {kattis_submission.score} on {kattis_submission.problem}."})
+                            submissions_by_user[user].edit(comment={'text_comment': comment_text})
                             info(
                                 f"updated {submissions_by_user[user]} {kattis_user2canvas_id[kattis_submission.user]} for {assignment.title}")
                     else:
