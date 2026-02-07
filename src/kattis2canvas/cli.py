@@ -52,6 +52,12 @@ class Submission(NamedTuple):
     date: datetime.datetime
 
 
+class AccessEntry(NamedTuple):
+    name: str
+    ip: str
+    time: datetime.datetime
+
+
 now = datetime.datetime.now(datetime.timezone.utc)
 
 
@@ -388,6 +394,139 @@ def extract_kattis_date(element: str) -> str:
 # convert canvas UTC to datetime
 def extract_canvas_date(element: str) -> datetime.datetime:
     return datetime.datetime.strptime(element, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+
+
+def parse_timespec(spec: str) -> datetime.datetime:
+    """Parse a TIMESPEC string into a UTC datetime.
+
+    Formats:
+      - Relative: -XXXy where y is s/m/h/d/w (e.g. -30m, -7d, -2w)
+      - Absolute: YEAR.MONTH.DAY-HH:MM (e.g. 2025.01.15-14:30)
+    """
+    # Try relative format
+    m = re.match(r'^-(\d+)([smhdw])$', spec)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        units = {'s': 'seconds', 'm': 'minutes', 'h': 'hours', 'd': 'days', 'w': 'weeks'}
+        delta = datetime.timedelta(**{units[unit]: amount})
+        return datetime.datetime.now(datetime.timezone.utc) - delta
+
+    # Try absolute format
+    m = re.match(r'^(\d{4})\.(\d{1,2})\.(\d{1,2})-(\d{1,2}):(\d{2})$', spec)
+    if m:
+        year, month, day, hour, minute = (int(x) for x in m.groups())
+        local_dt = datetime.datetime(year, month, day, hour, minute,
+                                     tzinfo=datetime.datetime.now().astimezone().tzinfo)
+        return local_dt.astimezone(datetime.timezone.utc)
+
+    raise click.BadParameter(f"invalid TIMESPEC: {spec}. Use YEAR.MONTH.DAY-HH:MM or -XXXs/m/h/d/w")
+
+
+def format_time(dt: datetime.datetime) -> str:
+    """Format a datetime in local timezone as YEAR.MONTH.DAY-HH:MM."""
+    local_dt = dt.astimezone(datetime.datetime.now().astimezone().tzinfo)
+    return local_dt.strftime("%Y.%m.%d-%H:%M")
+
+
+def get_access_log(offering: str, assignment_id: str, assignment_name: str = "") -> list[AccessEntry]:
+    """Scrape the access log for an assignment, handling pagination."""
+    if not assignment_name:
+        assignment_name = assignment_id
+    entries = []
+    base_url = f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/access-log"
+    page = 0
+
+    while True:
+        url = f"{base_url}?page={page}"
+        rsp = web_get(url)
+        bs = BeautifulSoup(rsp.content, 'html.parser')
+
+        # Try to find the table
+        table = bs.find("table", id="judge_table")
+        if not table:
+            table = bs.find("table")
+
+        if not table:
+            if page == 0:
+                warn(f"no access log table found for {assignment_name}")
+            break
+
+        # Read headers dynamically
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+        if not headers:
+            break
+
+        # Find column indices for name, IP, and time
+        name_col = None
+        ip_col = None
+        time_col = None
+        for i, h in enumerate(headers):
+            if 'name' in h or 'user' in h or 'student' in h:
+                name_col = i
+            elif 'ip' in h or 'address' in h:
+                ip_col = i
+            elif 'time' in h or 'date' in h or 'access' in h:
+                time_col = i
+
+        if name_col is None or ip_col is None or time_col is None:
+            if page == 0:
+                warn(f"could not identify columns in access log. headers: {headers}")
+            break
+
+        tbody = table.find("tbody")
+        rows = tbody.find_all("tr", recursive=False) if tbody else table.find_all("tr")[1:]
+
+        if not rows:
+            break
+
+        found_data = False
+        for row in rows:
+            cells = row.find_all("td", recursive=False)
+            if len(cells) <= max(name_col, ip_col, time_col):
+                continue
+
+            found_data = True
+            name = cells[name_col].get_text(strip=True)
+            ip = cells[ip_col].get_text(strip=True)
+            time_str = cells[time_col].get_text(strip=True)
+
+            try:
+                dt = dateparser.parse(time_str, tzinfos=TZINFOS)
+                if dt and dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                if dt:
+                    entries.append(AccessEntry(name=name, ip=ip, time=dt))
+            except (ValueError, TypeError):
+                warn(f"could not parse time '{time_str}' in access log")
+
+        if not found_data:
+            break
+
+        page += 1
+
+    return entries
+
+
+def aggregate_accesses(entries: list[AccessEntry],
+                       start: datetime.datetime,
+                       end: datetime.datetime) -> dict[str, list[tuple[str, datetime.datetime, datetime.datetime]]]:
+    """Group access entries by (name, ip) and track first/last access times.
+
+    Returns dict: name -> list of (ip, first_access, last_access), sorted by name.
+    """
+    grouped = collections.defaultdict(lambda: collections.defaultdict(list))
+    for entry in entries:
+        if start <= entry.time <= end:
+            grouped[entry.name][entry.ip].append(entry.time)
+
+    result = {}
+    for name in sorted(grouped):
+        ip_list = []
+        for ip, times in grouped[name].items():
+            ip_list.append((ip, min(times), max(times)))
+        result[name] = ip_list
+    return result
 
 
 class Assignment(NamedTuple):
@@ -949,6 +1088,67 @@ def sendemail(canvas_course):
                                                                                "course " + canvas_course + ".",
                                        subject='Reminder: Add kattis link in profile')
             info(f"Able to send conversation to : {link.canvas_user.id}")
+
+
+@top.command("list-accesses")
+@click.argument("course")
+@click.option("--offering", default="", help="substring to match offering (default: all)")
+@click.option("--assignment", default="", help="substring to match assignment (default: all)")
+@click.option("--starting", default=None, help="start time filter (YEAR.MONTH.DAY-HH:MM or -XXXs/m/h/d/w)")
+@click.option("--ending", default=None, help="end time filter (YEAR.MONTH.DAY-HH:MM or -XXXs/m/h/d/w)")
+@click.option("--pre-post-accesses", is_flag=True, default=False,
+              help="include accesses outside the assignment start/end times")
+def list_accesses(course, offering, assignment, starting, ending, pre_post_accesses):
+    """
+    Show when and from which IP addresses students accessed Kattis assignments.
+    COURSE is a substring to match against offering paths.
+    """
+    load_config()
+
+    # Parse explicit time overrides (applied per-assignment below)
+    explicit_start = parse_timespec(starting) if starting else None
+    explicit_end = parse_timespec(ending) if ending else None
+
+    for off in get_offerings(course):
+        if offering and offering not in off:
+            continue
+        for a in get_assignments(off):
+            if assignment and assignment not in a.title:
+                continue
+
+            # Determine time range for this assignment
+            if pre_post_accesses:
+                start = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+                end = datetime.datetime.now(datetime.timezone.utc)
+            else:
+                start = extract_canvas_date(a.start) if a.start else datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+                end = extract_canvas_date(a.end) if a.end else datetime.datetime.now(datetime.timezone.utc)
+
+            # Explicit --starting/--ending override
+            if explicit_start:
+                start = explicit_start
+            if explicit_end:
+                end = explicit_end
+
+            entries = get_access_log(off, a.assignment_id, a.title)
+            agg = aggregate_accesses(entries, start, end)
+            if not agg:
+                continue
+            # Extract COURSE/OFFERING from offering path /courses/COURSE/OFFERING
+            parts = off.strip('/').split('/')
+            if len(parts) >= 3:
+                course_offering = f"{parts[1]}/{parts[2]}"
+            else:
+                course_offering = off
+
+            # Header shows assignment start/end times
+            assign_start = extract_canvas_date(a.start) if a.start else start
+            assign_end = extract_canvas_date(a.end) if a.end else end
+            header = f"{course_offering} {a.title} {format_time(assign_start)}-{format_time(assign_end)}"
+            click.echo(header)
+            for name in sorted(agg):
+                for ip, first_access, last_access in agg[name]:
+                    click.echo(f"{name}\t{format_time(first_access)}-{format_time(last_access)}\t{ip}")
 
 
 if __name__ == "__main__":
