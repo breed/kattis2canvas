@@ -56,6 +56,7 @@ class AccessEntry(NamedTuple):
     name: str
     ip: str
     time: datetime.datetime
+    url: str = ""
 
 
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -457,10 +458,11 @@ def get_access_log(offering: str, assignment_id: str, assignment_name: str = "")
         if not headers:
             break
 
-        # Find column indices for name, IP, and time
+        # Find column indices for name, IP, time, and URL
         name_col = None
         ip_col = None
         time_col = None
+        url_col = None
         for i, h in enumerate(headers):
             if 'name' in h or 'user' in h or 'student' in h:
                 name_col = i
@@ -468,6 +470,8 @@ def get_access_log(offering: str, assignment_id: str, assignment_name: str = "")
                 ip_col = i
             elif 'time' in h or 'date' in h or 'access' in h:
                 time_col = i
+            elif 'url' in h or 'path' in h:
+                url_col = i
 
         if name_col is None or ip_col is None or time_col is None:
             if page == 0:
@@ -480,23 +484,28 @@ def get_access_log(offering: str, assignment_id: str, assignment_name: str = "")
         if not rows:
             break
 
+        required_cols = [name_col, ip_col, time_col]
+        if url_col is not None:
+            required_cols.append(url_col)
+
         found_data = False
         for row in rows:
             cells = row.find_all("td", recursive=False)
-            if len(cells) <= max(name_col, ip_col, time_col):
+            if len(cells) <= max(required_cols):
                 continue
 
             found_data = True
             name = cells[name_col].get_text(strip=True)
             ip = cells[ip_col].get_text(strip=True)
             time_str = cells[time_col].get_text(strip=True)
+            entry_url = cells[url_col].get_text(strip=True) if url_col is not None else ""
 
             try:
                 dt = dateparser.parse(time_str, tzinfos=TZINFOS)
                 if dt and dt.tzinfo is None:
                     dt = dt.replace(tzinfo=datetime.timezone.utc)
                 if dt:
-                    entries.append(AccessEntry(name=name, ip=ip, time=dt))
+                    entries.append(AccessEntry(name=name, ip=ip, time=dt, url=entry_url))
             except (ValueError, TypeError):
                 warn(f"could not parse time '{time_str}' in access log")
 
@@ -510,21 +519,24 @@ def get_access_log(offering: str, assignment_id: str, assignment_name: str = "")
 
 def aggregate_accesses(entries: list[AccessEntry],
                        start: datetime.datetime,
-                       end: datetime.datetime) -> dict[str, list[tuple[str, datetime.datetime, datetime.datetime]]]:
+                       end: datetime.datetime) -> dict[str, list[tuple[str, datetime.datetime, datetime.datetime, bool]]]:
     """Group access entries by (name, ip) and track first/last access times.
 
-    Returns dict: name -> list of (ip, first_access, last_access), sorted by name.
+    Returns dict: name -> list of (ip, first_access, last_access, submitted), sorted by name.
     """
     grouped = collections.defaultdict(lambda: collections.defaultdict(list))
+    submitted = collections.defaultdict(lambda: collections.defaultdict(bool))
     for entry in entries:
         if start <= entry.time <= end:
             grouped[entry.name][entry.ip].append(entry.time)
+            if entry.url.endswith('/submit'):
+                submitted[entry.name][entry.ip] = True
 
     result = {}
     for name in sorted(grouped):
         ip_list = []
         for ip, times in grouped[name].items():
-            ip_list.append((ip, min(times), max(times)))
+            ip_list.append((ip, min(times), max(times), submitted[name][ip]))
         result[name] = ip_list
     return result
 
@@ -1147,8 +1159,11 @@ def list_accesses(course, offering, assignment, starting, ending, pre_post_acces
             header = f"{course_offering} {a.title} {format_time(assign_start)}-{format_time(assign_end)}"
             click.echo(header)
             for name in sorted(agg):
-                for ip, first_access, last_access in agg[name]:
-                    click.echo(f"{name}\t{format_time(first_access)}-{format_time(last_access)}\t{ip}")
+                for ip, first_access, last_access, did_submit in agg[name]:
+                    line = f"{name}\t{format_time(first_access)}-{format_time(last_access)}\t{ip}"
+                    if did_submit:
+                        line += "\tSUBMITTED"
+                    click.echo(line)
 
 
 if __name__ == "__main__":
