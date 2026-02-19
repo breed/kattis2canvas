@@ -790,7 +790,7 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
 
     # make sure assignments are in place
     sorted_assignments = list(get_assignments(offerings[0]))
-    sorted_assignments.sort(key=lambda a: a.start)
+    sorted_assignments.sort(key=lambda a: a.start or "")
     for assignment in sorted_assignments:
         description = assignment.description if assignment.description else ""
 
