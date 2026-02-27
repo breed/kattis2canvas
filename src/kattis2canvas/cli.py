@@ -728,7 +728,8 @@ def get_courses(canvas: Canvas, name: str, is_active=True, is_finished=False) ->
 @click.option("--add-to-module", help="the module to add the assignment to.")
 @click.option("--assignment-group", default="kattis", help="the canvas assignment group to use (default: kattis).")
 @click.option("--section", help="only create assignments for this specific section.")
-def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignment_group, section):
+@click.option("--rubric", help="the rubric to attach to each assignment (matched by title).")
+def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignment_group, section, rubric):
     """
     create assignments in canvas for all the assignments in kattis.
     """
@@ -743,6 +744,24 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
 
     canvas = Canvas(config.canvas_url, config.canvas_token)
     course = get_course(canvas, canvas_course)
+
+    # Resolve rubric if specified
+    canvas_rubric = None
+    if rubric:
+        all_rubrics = list(course.get_rubrics())
+        matches = [r for r in all_rubrics if rubric.lower() in r.title.lower()]
+        if len(matches) == 0:
+            error(f"no rubric matching '{rubric}' found. available rubrics:")
+            for r in all_rubrics:
+                error(f"    {r.title}")
+            exit(5)
+        elif len(matches) > 1:
+            error(f"multiple rubrics matching '{rubric}':")
+            for r in matches:
+                error(f"    {r.title}")
+            exit(5)
+        canvas_rubric = matches[0]
+        info(f"using rubric '{canvas_rubric.title}'.")
 
     # Get section if specified
     canvas_section = None
@@ -836,6 +855,18 @@ def course2canvas(offering, canvas_course, dryrun, force, add_to_module, assignm
                 canvas_assignments[assignment.title] = course.create_assignment(assignment_data)
                 section_info = f" for section {section}" if canvas_section else ""
                 info(f"created {assignment.title}{section_info}.")
+        if canvas_rubric:
+            if dryrun:
+                info(f"would attach rubric '{canvas_rubric.title}' to {assignment.title}.")
+            elif assignment.title in canvas_assignments:
+                course.create_rubric_association(rubric_association={
+                    'rubric_id': canvas_rubric.id,
+                    'association_id': canvas_assignments[assignment.title].id,
+                    'association_type': 'Assignment',
+                    'use_for_grading': True,
+                    'purpose': 'grading',
+                })
+                info(f"attached rubric '{canvas_rubric.title}' to {assignment.title}.")
         if add_to_module:
             if assignment.title not in [i.title for i in add_to_module.get_module_items()]:
                 add_to_module.create_module_item(module_item={
