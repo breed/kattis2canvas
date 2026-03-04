@@ -1049,8 +1049,8 @@ def submissions2canvas(offering, canvas_course, dryrun, assignment_group, sectio
                         info(f"{user} up to date")
 
 
-def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
-    best_submissions = collections.defaultdict(dict)
+def _scrape_submissions(offering: str, assignment_id: str):
+    """Yield all Submission objects from the /submissions page."""
     base_url = f"https://{config.kattis_hostname}{offering}/assignments/{assignment_id}/submissions"
     headers = None
     page = 0
@@ -1084,30 +1084,59 @@ def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submi
                 a = td.find("a")
                 props[headers[index]] = a.get("href") if a else td.get_text().strip()
             date = props["Date"]
+            local_tz = datetime.datetime.now().astimezone().tzinfo
             if "-" in date:
-                date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=now.tzinfo)
+                date = datetime.datetime.strptime(date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=local_tz)
             else:
+                local_now = datetime.datetime.now(local_tz)
                 hms = datetime.datetime.strptime(date, "%H:%M:%S")
-                date = now.replace(hour=hms.hour, minute=hms.minute, second=hms.second)
+                date = local_now.replace(hour=hms.hour, minute=hms.minute, second=hms.second)
                 # it's not clear when the short date version is used. it might be used when it is less than 24 hours,
                 # in which case, just setting the time will make the date 24 hours more than it should be
-                if date > now:
+                if date > local_now:
                     date -= datetime.timedelta(days=1)
 
             score = 0.0 if props["Test cases"] == "-/-" else float(Fraction(props["Test cases"])) * 100
-            submission = Submission(user=extract_last(props["User"]), problem=extract_last(props["Problem"]), date=date,
-                                    score=score, url=props[""])
-            if submission.problem not in best_submissions[submission.user]:
-                best_submissions[submission.user][submission.problem] = submission
-            else:
-                current_best = best_submissions[submission.user][submission.problem]
-                if current_best.score < submission.score or (
-                        current_best.score == submission.score and current_best.date < submission.date):
-                    best_submissions[submission.user][submission.problem] = submission
+            yield Submission(user=extract_last(props["User"]), problem=extract_last(props["Problem"]), date=date,
+                             score=score, url=props[""])
 
         page += 1
 
+
+def get_best_submissions(offering: str, assignment_id: str) -> {str: {str: Submission}}:
+    best_submissions = collections.defaultdict(dict)
+    for submission in _scrape_submissions(offering, assignment_id):
+        if submission.problem not in best_submissions[submission.user]:
+            best_submissions[submission.user][submission.problem] = submission
+        else:
+            current_best = best_submissions[submission.user][submission.problem]
+            if current_best.score < submission.score or (
+                    current_best.score == submission.score and current_best.date < submission.date):
+                best_submissions[submission.user][submission.problem] = submission
     return best_submissions
+
+
+def get_all_submissions(offering: str, assignment_id: str) -> list[Submission]:
+    return list(_scrape_submissions(offering, assignment_id))
+
+
+def aggregate_submissions(submissions: list[Submission]) -> dict[str, dict]:
+    """Group submissions by user; return first/last failed and first/last successful for each."""
+    by_user = collections.defaultdict(list)
+    for s in submissions:
+        by_user[s.user].append(s)
+
+    result = {}
+    for user, subs in by_user.items():
+        failed = sorted([s for s in subs if s.score < 100], key=lambda s: s.date)
+        successful = sorted([s for s in subs if s.score == 100], key=lambda s: s.date)
+        result[user] = {
+            "first_failed": failed[0] if failed else None,
+            "last_failed": failed[-1] if failed else None,
+            "first_successful": successful[0] if successful else None,
+            "last_successful": successful[-1] if successful else None,
+        }
+    return result
 
 
 @top.command()
@@ -1131,6 +1160,62 @@ def sendemail(canvas_course):
                                                                                "course " + canvas_course + ".",
                                        subject='Reminder: Add kattis link in profile')
             info(f"Able to send conversation to : {link.canvas_user.id}")
+
+
+@top.command("list-submissions")
+@click.argument("course")
+@click.option("--offering", default="", help="substring to match offering (default: all)")
+@click.option("--assignment", default="", help="substring to match assignment (default: all)")
+@click.option("--sort-by-date", is_flag=True, default=False, help="sort students by last submission date instead of name")
+def list_submissions(course, offering, assignment, sort_by_date):
+    """
+    Show per-student first/last failed and first/last successful submission times.
+    COURSE is a substring to match against offering paths.
+    """
+    load_config()
+
+    local_tz = datetime.datetime.now().astimezone().tzinfo
+    click.echo(f"times in {local_tz}")
+
+    for off in get_offerings(course):
+        if offering and offering not in off:
+            continue
+        for a in get_assignments(off):
+            if assignment and assignment not in a.title:
+                continue
+
+            subs = get_all_submissions(off, a.assignment_id)
+            agg = aggregate_submissions(subs)
+            if not agg:
+                continue
+
+            parts = off.strip('/').split('/')
+            if len(parts) >= 3:
+                course_offering = f"{parts[1]}/{parts[2]}"
+            else:
+                course_offering = off
+
+            click.echo(f"{course_offering}  {a.title}")
+            date_width = 16  # width of YYYY.MM.DD-HH:MM
+            if sort_by_date:
+                def _last_date(user):
+                    e = agg[user]
+                    dates = [s.date for s in [e["last_failed"], e["last_successful"]] if s]
+                    return max(dates) if dates else datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+                users = sorted(agg, key=_last_date)
+            else:
+                users = sorted(agg)
+            name_width = max(len(u) for u in users)
+            click.echo(f"{'user':<{name_width}}  {'first_failed':<{date_width}}  {'last_failed':<{date_width}}  {'first_success':<{date_width}}  last_success")
+            click.echo(f"{'-' * name_width}  {'-' * date_width}  {'-' * date_width}  {'-' * date_width}  {'-' * date_width}")
+            for user in users:
+                entry = agg[user]
+                ff = format_time(entry["first_failed"].date) if entry["first_failed"] else ""
+                lf = format_time(entry["last_failed"].date) if entry["last_failed"] else ""
+                fs = format_time(entry["first_successful"].date) if entry["first_successful"] else ""
+                ls = format_time(entry["last_successful"].date) if entry["last_successful"] else ""
+                click.echo(f"{user:<{name_width}}  {ff:<{date_width}}  {lf:<{date_width}}  {fs:<{date_width}}  {ls}")
+            click.echo("----")
 
 
 @top.command("list-accesses")
